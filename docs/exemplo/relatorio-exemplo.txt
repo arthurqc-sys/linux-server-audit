@@ -1,0 +1,62 @@
+==================================================
+          RELATORIO DE AUDITORIA LINUX
+==================================================
+
+Data da auditoria: 24/11/2026 08:00:00
+Hostname: servidor-producao
+
+--------------------------------------------------
+1. IDENTIDADE DA MAQUINA
+--------------------------------------------------
+
+Sistema operacional:
+Kernel:
+Uptime:
+Arquitetura:
+
+--------------------------------------------------
+2. HARDWARE E RECURSOS
+--------------------------------------------------
+
+Processadores:
+Memoria RAM:
+Utilizacao de disco:
+Swap:
+
+--------------------------------------------------
+3. REDE
+--------------------------------------------------
+
+Interfaces:
+Rotas:
+Portas em escuta:
+DNS:
+
+--------------------------------------------------
+4. PROCESSOS E SERVICOS
+--------------------------------------------------
+
+Top 5 CPU:
+Top 5 Memoria:
+Servicos habilitados:
+Servicos ativos:
+
+--------------------------------------------------
+5. USUARIOS E SEGURANCA
+--------------------------------------------------
+
+Usuarios:
+Ultimos logins:
+Configuracao SSH:
+Chaves autorizadas:
+
+--------------------------------------------------
+6. LOGS RECENTES
+--------------------------------------------------
+
+Logs do sistema:
+Falhas de autenticacao SSH:
+
+==================================================
+              FIM DA AUDITORIA
+==================================================

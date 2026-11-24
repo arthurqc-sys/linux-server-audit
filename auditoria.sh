@@ -39,6 +39,19 @@ coletar() {
   if "$@" >> "$ARQUIVO" 2>&1; then :; else linha "[Indisponível ou sem permissão para executar: $*]"; fi
   linha ""
 }
+coletar_falhas_auth() {
+  local fonte="$1"; shift
+  local -a status
+  "$@" | grep -Ei 'failed password|authentication failure|invalid user|failed publickey' | tail -n 50 >> "$ARQUIVO"
+  status=("${PIPESTATUS[@]}")
+  if [ "${status[0]}" -ne 0 ]; then
+    linha "[Não foi possível consultar os logs de autenticação em $fonte.]"
+  elif [ "${status[1]}" -eq 1 ]; then
+    linha 'Nenhuma falha de autenticação correspondente foi encontrada nos logs consultados.'
+  elif [ "${status[1]}" -ne 0 ] || [ "${status[2]}" -ne 0 ]; then
+    linha "[Falha ao filtrar ou registrar os logs de autenticação em $fonte.]"
+  fi
+}
 
 # Registra no início do arquivo o contexto básico da execução da auditoria.
 {
@@ -91,10 +104,10 @@ if [ -r /etc/resolv.conf ]; then cat /etc/resolv.conf >> "$ARQUIVO"; else linha 
 secao 'SEÇÃO 4 — PROCESSOS E SERVIÇOS'
 if comando_disponivel ps; then
   linha '--- Top 5 processos por consumo de CPU ---'
-  ps -eo pid,ppid,user,%cpu,%mem,comm --sort=-%cpu 2>/dev/null | head -n 6 >> "$ARQUIVO" || linha '[indisponível]'
+  ps -eo pid,ppid,user,%cpu,%mem,comm --sort=-%cpu 2>/dev/null | awk -v auditoria_pid="$$" 'NR == 1 || $1 != auditoria_pid' | head -n 6 >> "$ARQUIVO" || linha '[indisponível]'
   linha ''
   linha '--- Top 5 processos por consumo de memória ---'
-  ps -eo pid,ppid,user,%cpu,%mem,comm --sort=-%mem 2>/dev/null | head -n 6 >> "$ARQUIVO" || linha '[indisponível]'
+  ps -eo pid,ppid,user,%cpu,%mem,comm --sort=-%mem 2>/dev/null | awk -v auditoria_pid="$$" 'NR == 1 || $1 != auditoria_pid' | head -n 6 >> "$ARQUIVO" || linha '[indisponível]'
 else linha 'Comando ps indisponível.'; fi
 if comando_disponivel systemctl; then
   coletar 'Serviços habilitados no systemd (inicialização)' systemctl list-unit-files --type=service --state=enabled --no-pager
@@ -103,31 +116,71 @@ else linha 'systemctl indisponível (sistema pode não usar systemd).'; fi
 
 # Examina contas interativas e configurações relacionadas ao acesso SSH.
 secao 'SEÇÃO 5 — USUÁRIOS E SEGURANÇA'
-linha '--- Usuários com shell interativo (shell diferente de nologin/false) ---'
+UID_MIN=$(awk '$1 == "UID_MIN" {print $2; exit}' /etc/login.defs 2>/dev/null)
+if ! [[ "$UID_MIN" =~ ^[0-9]+$ ]]; then UID_MIN=1000; fi
+linha "Classificação aproximada por UID_MIN de /etc/login.defs (fallback: 1000): $UID_MIN"
+linha "--- Contas de usuário (UID >= $UID_MIN) com shell interativo ---"
 if [ -r /etc/passwd ]; then
-  awk -F: '($7 !~ /(nologin|false)$/ && $7 != "") {printf "usuário=%s uid=%s home=%s shell=%s\n",$1,$3,$6,$7}' /etc/passwd >> "$ARQUIVO"
+  awk -F: -v min="$UID_MIN" '($3 + 0 >= min && $7 != "" && $7 !~ /(nologin|false|sync|shutdown|halt)$/) {printf "usuário=%s uid=%s home=%s shell=%s\n",$1,$3,$6,$7}' /etc/passwd >> "$ARQUIVO"
+  linha ''
+  linha "--- Contas de sistema/serviço (UID > 0 e < $UID_MIN), inclusive sem shell interativo ---"
+  awk -F: -v min="$UID_MIN" '($3 + 0 > 0 && $3 + 0 < min) {printf "conta=%s uid=%s home=%s shell=%s\n",$1,$3,$6,$7}' /etc/passwd >> "$ARQUIVO"
+  linha ''
+  linha '--- Contas administrativas (UID 0) ---'
+  awk -F: '($3 + 0 == 0) {printf "conta=%s uid=%s home=%s shell=%s\n",$1,$3,$6,$7}' /etc/passwd >> "$ARQUIVO"
 else linha '/etc/passwd indisponível'; fi
 linha ''
-coletar 'Últimos logins registrados por usuário' lastlog
+if comando_disponivel lastlog; then
+  coletar 'Últimos logins registrados por usuário' lastlog
+elif comando_disponivel last; then
+  linha 'lastlog não está instalado; usando last como alternativa (histórico wtmp disponível):'
+  if last -F -w >> "$ARQUIVO" 2>&1; then :; else linha '[Não foi possível consultar o histórico de logins com last.]'; fi
+else
+  linha 'Verificação de último login indisponível: nem lastlog nem last estão instalados.'
+fi
 linha '--- Login SSH do root ---'
-if comando_disponivel sshd; then
-  SSH_ROOT=$(sshd -T 2>/dev/null | awk '$1=="permitrootlogin" {print $2; exit}')
-  if [ -n "$SSH_ROOT" ]; then linha "PermitRootLogin efetivo: $SSH_ROOT"; else linha 'Não foi possível obter PermitRootLogin via sshd -T (pode exigir privilégios ou configuração válida).'; fi
+SSHD_BIN=$(command -v sshd 2>/dev/null || true)
+if [ -z "$SSHD_BIN" ]; then
+  for candidato in /usr/sbin/sshd /sbin/sshd; do
+    if [ -x "$candidato" ]; then SSHD_BIN="$candidato"; break; fi
+  done
+fi
+if [ -n "$SSHD_BIN" ]; then
+  if SSH_CONFIG_EFETIVA=$("$SSHD_BIN" -T -C "user=root,host=localhost,addr=127.0.0.1" 2>/dev/null); then
+    SSH_ROOT=$(printf '%s\n' "$SSH_CONFIG_EFETIVA" | awk '$1 == "permitrootlogin" {print $2; exit}')
+    case "$SSH_ROOT" in
+      yes) linha 'PermitRootLogin efetivo: yes — login SSH de root permitido (conforme as demais regras de autenticação).' ;;
+      prohibit-password|without-password) linha "PermitRootLogin efetivo: $SSH_ROOT — login SSH de root permitido sem senha, sujeito às demais regras de autenticação." ;;
+      forced-commands-only) linha 'PermitRootLogin efetivo: forced-commands-only — root permitido apenas com chave que imponha comando forçado.' ;;
+      no) linha 'PermitRootLogin efetivo: no — login SSH de root proibido.' ;;
+      *) linha 'Não foi possível localizar PermitRootLogin na configuração efetiva do sshd.' ;;
+    esac
+    linha 'A configuração efetiva foi avaliada para user=root, host=localhost, addr=127.0.0.1; regras Match dependentes do cliente podem variar.'
+  else
+    linha 'Não foi possível avaliar a configuração efetiva via sshd -T (verifique privilégios e validade da configuração).'
+  fi
 elif [ -r /etc/ssh/sshd_config ]; then
   ROOT_CFG=$(awk 'tolower($1)=="permitrootlogin" {v=$2} END {if(v!="") print v}' /etc/ssh/sshd_config)
-  linha "Diretiva PermitRootLogin encontrada no arquivo principal: ${ROOT_CFG:-não definida (verifique Includes e padrões do OpenSSH)}"
+  linha "sshd não está disponível para avaliar Includes, Match e padrões; diretiva literal no arquivo principal: ${ROOT_CFG:-não definida}."
 else linha 'sshd e configuração SSH não encontrados.'; fi
 linha ''
-linha '--- Chaves SSH autorizadas do usuário que executou o script ---'
-HOME_ATUAL="${HOME:-}"
-if [ -n "$HOME_ATUAL" ] && [ -r "$HOME_ATUAL/.ssh/authorized_keys" ]; then
+USUARIO_CHAVES="${SUDO_USER:-$(id -un 2>/dev/null || printf 'desconhecido')}"
+HOME_CHAVES=''
+if [ -n "$USUARIO_CHAVES" ] && comando_disponivel getent; then
+  HOME_CHAVES=$(getent passwd "$USUARIO_CHAVES" | awk -F: -v usuario="$USUARIO_CHAVES" '$1 == usuario {print $6; exit}')
+elif [ -n "$USUARIO_CHAVES" ] && [ -r /etc/passwd ]; then
+  HOME_CHAVES=$(awk -F: -v usuario="$USUARIO_CHAVES" '$1 == usuario {print $6; exit}' /etc/passwd)
+fi
+if [ -z "${SUDO_USER:-}" ] && [ -z "$HOME_CHAVES" ]; then HOME_CHAVES="${HOME:-}"; fi
+linha "--- Chaves SSH autorizadas de $USUARIO_CHAVES (SUDO_USER quando executado via sudo) ---"
+if [ -n "$HOME_CHAVES" ] && [ -r "$HOME_CHAVES/.ssh/authorized_keys" ]; then
   # Exibe fingerprints em vez do conteúdo das chaves, reduzindo exposição de dados.
   if comando_disponivel ssh-keygen; then
-    ssh-keygen -lf "$HOME_ATUAL/.ssh/authorized_keys" >> "$ARQUIVO" 2>&1 || linha '[Não foi possível calcular fingerprints.]'
+    ssh-keygen -lf "$HOME_CHAVES/.ssh/authorized_keys" >> "$ARQUIVO" 2>&1 || linha '[Não foi possível calcular fingerprints.]'
   else
-    awk 'NF && $1 !~ /^#/ {print "Tipo de chave: " $1 " (fingerprint indisponível sem ssh-keygen)"}' "$HOME_ATUAL/.ssh/authorized_keys" >> "$ARQUIVO"
+    awk 'NF && $1 !~ /^#/ {print "Tipo de chave: " $1 " (fingerprint indisponível sem ssh-keygen)"}' "$HOME_CHAVES/.ssh/authorized_keys" >> "$ARQUIVO"
   fi
-else linha 'Nenhum arquivo authorized_keys legível encontrado para o usuário atual.'; fi
+else linha 'Nenhum arquivo authorized_keys legível encontrado para o usuário indicado.'; fi
 
 # Reúne logs recentes e procura registros comuns de falhas de autenticação.
 secao 'SEÇÃO 6 — LOGS RECENTES'
@@ -143,11 +196,11 @@ else linha 'journalctl, syslog e messages indisponíveis ou sem permissão.'; fi
 linha ''
 linha '--- Falhas recentes de autenticação/SSH (quando disponíveis) ---'
 if comando_disponivel journalctl; then
-  journalctl --since '7 days ago' --no-pager 2>/dev/null | grep -Ei 'failed password|authentication failure|invalid user|failed publickey' | tail -n 50 >> "$ARQUIVO" || linha 'Nenhuma ocorrência encontrada ou logs sem acesso.'
+  coletar_falhas_auth 'journal do sistema' journalctl --since '7 days ago' --no-pager
 elif [ -r /var/log/auth.log ]; then
-  grep -Ei 'failed password|authentication failure|invalid user|failed publickey' /var/log/auth.log | tail -n 50 >> "$ARQUIVO" || linha 'Nenhuma ocorrência encontrada.'
+  coletar_falhas_auth '/var/log/auth.log' cat /var/log/auth.log
 elif [ -r /var/log/secure ]; then
-  grep -Ei 'failed password|authentication failure|invalid user|failed publickey' /var/log/secure | tail -n 50 >> "$ARQUIVO" || linha 'Nenhuma ocorrência encontrada.'
+  coletar_falhas_auth '/var/log/secure' cat /var/log/secure
 else linha 'Log de autenticação não encontrado ou sem permissão.'; fi
 
 # Consulta atualizações disponíveis quando o gerenciador APT está instalado.
@@ -186,19 +239,46 @@ linha 'FIM DO RELATÓRIO'
 linha "Gerado em: $(date '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || echo 'indisponível')"
 printf "${VERDE}[+] Auditoria concluída. Relatório: %s${RESET}\n" "$ARQUIVO"
 
-# Se configurado explicitamente, tenta enviar o relatório pelo mail ou sendmail.
+# Tenta os transportes disponíveis; sucesso indica aceitação pelo transporte, não entrega final.
 if [ -n "${AUDIT_EMAIL:-}" ]; then
-  if comando_disponivel mail; then
-    if mail -s "Auditoria do servidor $(hostname 2>/dev/null)" "$AUDIT_EMAIL" < "$ARQUIVO"; then
-      printf "${VERDE}[+] Relatório enviado para %s usando mail.${RESET}\n" "$AUDIT_EMAIL"
-    else printf "${AMARELO}[!] Falha ao enviar e-mail com mail.${RESET}\n"; fi
-  elif comando_disponivel sendmail; then
-    {
+  EMAIL_ACEITO=0
+  EMAIL_TRANSPORTE_ENCONTRADO=0
+  if comando_disponivel msmtp; then
+    EMAIL_TRANSPORTE_ENCONTRADO=1
+    if {
       printf 'To: %s\n' "$AUDIT_EMAIL"
       printf 'Subject: Auditoria do servidor %s\n' "$(hostname 2>/dev/null)"
       printf 'MIME-Version: 1.0\nContent-Type: text/plain; charset=UTF-8\n\n'
       cat "$ARQUIVO"
-    } | sendmail -t
-    printf "${VERDE}[+] Solicitação de envio entregue ao sendmail.${RESET}\n"
-  else printf "${AMARELO}[!] AUDIT_EMAIL definido, mas mail/sendmail não está instalado.${RESET}\n"; fi
+    } | msmtp "$AUDIT_EMAIL"; then
+      EMAIL_ACEITO=1
+      printf "${VERDE}[+] Relatório aceito para envio pelo msmtp para %s; a entrega final depende do servidor SMTP.${RESET}\n" "$AUDIT_EMAIL"
+    else printf "${AMARELO}[!] msmtp foi encontrado, mas não conseguiu enviar; tentando outro transporte disponível.${RESET}\n"; fi
+  fi
+  if [ "$EMAIL_ACEITO" -eq 0 ] && comando_disponivel sendmail; then
+    EMAIL_TRANSPORTE_ENCONTRADO=1
+    if {
+      printf 'To: %s\n' "$AUDIT_EMAIL"
+      printf 'Subject: Auditoria do servidor %s\n' "$(hostname 2>/dev/null)"
+      printf 'MIME-Version: 1.0\nContent-Type: text/plain; charset=UTF-8\n\n'
+      cat "$ARQUIVO"
+    } | sendmail -t; then
+      EMAIL_ACEITO=1
+      printf "${VERDE}[+] Relatório aceito pelo sendmail para processamento; a entrega final não foi confirmada.${RESET}\n"
+    else printf "${AMARELO}[!] sendmail foi encontrado, mas não aceitou o relatório; tentando mail se disponível.${RESET}\n"; fi
+  fi
+  if [ "$EMAIL_ACEITO" -eq 0 ] && comando_disponivel mail; then
+    EMAIL_TRANSPORTE_ENCONTRADO=1
+    if mail -s "Auditoria do servidor $(hostname 2>/dev/null)" "$AUDIT_EMAIL" < "$ARQUIVO"; then
+      EMAIL_ACEITO=1
+      printf "${VERDE}[+] mail aceitou o relatório via transporte configurado; a entrega final não foi confirmada.${RESET}\n"
+    else printf "${AMARELO}[!] mail está instalado, mas não confirmou transporte funcional.${RESET}\n"; fi
+  fi
+  if [ "$EMAIL_ACEITO" -eq 0 ]; then
+    if [ "$EMAIL_TRANSPORTE_ENCONTRADO" -eq 0 ]; then
+      printf "${AMARELO}[!] Relatório gerado, mas não enviado: msmtp, sendmail e mail não estão disponíveis. Arquivo: %s${RESET}\n" "$ARQUIVO"
+    else
+      printf "${AMARELO}[!] Relatório gerado, mas não enviado: nenhum transporte disponível aceitou o envio. Arquivo: %s${RESET}\n" "$ARQUIVO"
+    fi
+  fi
 fi
