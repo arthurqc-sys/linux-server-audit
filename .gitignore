@@ -1,0 +1,16 @@
+# Relatórios gerados
+auditoria_servidor.txt
+*.log
+
+# Arquivos temporários
+*.tmp
+*.bak
+*.swp
+
+# Configurações locais e credenciais
+.env
+.env.*
+*.conf.local
+
+# Backups
+*.backup
